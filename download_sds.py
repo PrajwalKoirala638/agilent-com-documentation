@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 # Agilent SDS downloader.
 #
-# Downloads the Safety Data Sheet PDFs found on Agilent's chemical-standards search page.
+# JOB 1: Downloads the Safety Data Sheet PDFs found on Agilent's chemical-standards search page.
 # Every document can exist in several regional versions; exactly ONE version is downloaded per document:
 #   1. _NAEnglish.pdf is the default and is always preferred.
 #   2. If it is not available, _NACanada.pdf is downloaded instead.
 #   3. If neither is available, one of _Australia.pdf, _EUEnglish.pdf, _MalayEnglish.pdf or _UKEnglish.pdf is used.
 #   4. If none of these versions exists, the document is skipped. Any other file format is ignored.
+#
+# JOB 2 (runs after job 1 has finished): Walks through the result pages of
+# https://www.agilent.com/en/search/safety-data-sheets and downloads every card that is labelled
+# "English - United States". It downloads those on the current page, goes to the next page, and repeats.
+#
 # The browser is controlled through invisible_playwright (Playwright on an anti-detect Firefox).
 #
 # How the script works:
@@ -95,6 +100,30 @@ ALLOWED_VERSION_SUFFIXES_BEST_FIRST = (
     DEFAULT_VERSION_SUFFIX,
     FIRST_FALLBACK_VERSION_SUFFIX,
 ) + OTHER_VERSION_SUFFIXES  # Every format that may be downloaded, best first; all other formats are ignored
+
+# ---- Job 2: the "Safety Data Sheets (SDS)" search page
+SDS_PAGE_PLAIN_URL = "https://www.agilent.com/en/search/safety-data-sheets"  # The page with every safety data sheet
+SDS_PAGE_FILTERED_URL = (
+    "https://www.agilent.com/en/search/safety-data-sheets"
+    "?cq=%40objecttype%3D%3D%22Material%20Safety%20Data%20Sheet%22"
+    "%20AND%20%40locale%3D%3D%22English_UNITED%20STATES%22"
+)  # Same page, but asking the search engine for US English documents only (tried first)
+TRY_FILTERED_SDS_URL_FIRST = (
+    True  # If the filtered address shows no results, the plain address is used instead
+)
+US_ENGLISH_LABEL = (
+    "English - United States"  # Only cards carrying this language tag are downloaded
+)
+SDS_RESULTS_SCOPE_SELECTOR = "[data-tab-content='documentsSupport']"  # The results tab that holds the safety data sheet cards
+SDS_NEXT_BUTTON_SELECTOR = (
+    SDS_RESULTS_SCOPE_SELECTOR + " agt-pagination button[data-action='next']"
+)  # The "next page" button of that tab
+MAXIMUM_SDS_RESULT_PAGES = (
+    600  # Safety limit; the site shows at most 500 pages of 10 results
+)
+SDS_PAGE_CHANGE_TIMEOUT_SECONDS = (
+    20  # How long to wait for new cards to appear after clicking "next"
+)
 
 BROWSER_WINDOW_WIDTH_PIXELS = 1920  # Browser window width in pixels (full HD)
 BROWSER_WINDOW_HEIGHT_PIXELS = 1080  # Browser window height in pixels (full HD)
@@ -1906,7 +1935,7 @@ def download_documents_using_temporary_tab(
         )  # Download one version of each document
 
 
-# ============================================================== SCRAPING
+# ============================================================== SCRAPING (JOB 1: KEYWORD SEARCH)
 
 
 def search_one_keyword_and_download_pdfs(
@@ -2042,6 +2071,315 @@ def search_one_keyword_and_download_pdfs(
     del all_keyword_urls  # Release the memory held by this keyword's address set
     browser_session.close_unneeded_tabs()  # The keyword is done, so close anything that is not needed
     return True  # The keyword was searched
+
+
+# ============================================================== SCRAPING (JOB 2: US ENGLISH SDS PAGE)
+#
+# The page https://www.agilent.com/en/search/safety-data-sheets shows 10 cards per page. Every card has
+#   <a class="pub-ext" href="/library/msds/....pdf">  and a tag line such as  <span class="meta-text">English - United States</span>
+# Only the cards tagged "English - United States" are downloaded. Then the "next" button of the
+# pagination bar is clicked, and the same is repeated on the following page.
+
+READ_SDS_CARDS_SCRIPT = (  # JavaScript that describes every card in the safety data sheet results tab
+    "(scopeSelector) => {"  # The argument is the CSS selector of the results tab
+    "const scope = document.querySelector(scopeSelector);"  # Find the results tab
+    "if (!scope) return [];"  # No tab means no cards
+    "return Array.from(scope.querySelectorAll('.compendiumcard')).map(card => {"  # Go through every card
+    "const link = card.querySelector('a.pub-ext');"  # The link to the PDF
+    "const labels = Array.from(card.querySelectorAll('.meta-text')).map(tag => tag.innerText.trim());"  # The tags: date, file type, language
+    "return {href: link ? link.href : null, labels: labels};"  # Give back the address and the tags
+    "});"  # End of the loop over cards
+    "}"  # End of the function
+)  # End of the script
+
+
+def read_sds_cards(
+    browser_page: Page,
+) -> list:  # Read every card of the current result page
+    card_descriptions = browser_page.evaluate(
+        READ_SDS_CARDS_SCRIPT, SDS_RESULTS_SCOPE_SELECTOR
+    )  # Ask the page for its cards
+    return [
+        card_description
+        for card_description in card_descriptions
+        if card_description.get("href")
+    ]  # Ignore cards without a link
+
+
+def get_us_english_urls_from_cards(
+    card_descriptions: list,
+) -> set:  # Keep only the cards tagged "English - United States"
+    us_english_urls = {
+        card_description["href"]
+        for card_description in card_descriptions
+        if US_ENGLISH_LABEL in card_description["labels"]
+        and urlparse(card_description["href"]).path.lower().endswith(".pdf")
+    }  # Only real PDF links with the right language tag
+    return us_english_urls  # Give the addresses back
+
+
+def wait_for_sds_cards_to_appear(
+    browser_page: Page, timeout_seconds: float
+) -> bool:  # Wait until at least one card is on the page
+    wait_deadline = time.time() + timeout_seconds  # The moment when we give up
+    while time.time() < wait_deadline:  # Keep checking until the time is up
+        try:  # Reading can fail while the page is changing
+            if read_sds_cards(browser_page):  # There are cards
+                return True  # Done
+        except PlaywrightError as browser_error:  # The read did not work
+            if is_browser_closed_error(browser_error):  # The browser itself is gone
+                raise  # Let the restart logic deal with it
+        time.sleep(0.5)  # Wait a moment and look again
+    return False  # No cards appeared in time
+
+
+def wait_for_sds_cards_to_change(
+    browser_page: Page, previous_links: tuple
+) -> bool:  # Wait until the page shows different cards than before
+    wait_deadline = (
+        time.time() + SDS_PAGE_CHANGE_TIMEOUT_SECONDS
+    )  # The moment when we give up
+    while time.time() < wait_deadline:  # Keep checking until the time is up
+        try:  # Reading can fail while the page is changing
+            current_links = tuple(
+                card_description["href"]
+                for card_description in read_sds_cards(browser_page)
+            )  # The addresses now on the page
+            if (
+                current_links and current_links != previous_links
+            ):  # New cards are showing
+                time.sleep(1)  # Let the page finish drawing
+                return True  # The page changed
+        except PlaywrightError as browser_error:  # The read did not work
+            if is_browser_closed_error(browser_error):  # The browser itself is gone
+                raise  # Let the restart logic deal with it
+        time.sleep(0.5)  # Wait a moment and look again
+    return False  # The cards never changed
+
+
+def click_next_sds_page(
+    browser_page: Page,
+) -> bool:  # Click the "next" button of the safety data sheet results
+    next_button = browser_page.locator(
+        SDS_NEXT_BUTTON_SELECTOR
+    ).first  # The first matching "next" button inside the right tab
+    try:  # The button may be missing or disabled
+        if next_button.count() == 0:  # There is no such button
+            download_logger.info("[SDS page] no next button found")  # Record it
+            return False  # Nothing to click
+        if (
+            next_button.is_disabled()
+            or next_button.get_attribute("aria-disabled") == "true"
+            or next_button.get_attribute("disabled") is not None
+        ):  # The button is switched off, which means this is the last page
+            download_logger.info(
+                "[SDS page] the next button is disabled, last page reached"
+            )  # Record it
+            return False  # Nothing to click
+        click_element_like_a_human(
+            browser_page, next_button
+        )  # Move the pointer to the button like a person and click it
+        download_logger.info("[SDS page] clicked the next button")  # Record the click
+        return True  # We asked for the next page
+    except PlaywrightError as browser_error:  # The click did not work
+        if is_browser_closed_error(browser_error):  # The browser itself is gone
+            raise  # Let the restart logic deal with it
+        download_logger.warning(
+            "[SDS page] clicking next failed (%s), trying the generic next button search",
+            str(browser_error).splitlines()[0],
+        )  # Record the problem
+        return click_next_page_button(
+            browser_page
+        )  # Fall back to the generic search for a next button
+
+
+def read_sds_page_position(
+    browser_page: Page,
+) -> str:  # A short text such as "11 - 20 of 200087 results" for the log
+    try:  # The element may be missing
+        return (
+            browser_page.locator(SDS_RESULTS_SCOPE_SELECTOR + " .agt-pagination__info")
+            .first.inner_text(timeout=2000)
+            .strip()
+        )  # Read the pagination info text
+    except PlaywrightError:  # The element could not be read
+        return "position unknown"  # Say so
+
+
+def open_sds_search_page(
+    browser_page: Page, run_statistics: RunStatistics
+) -> bool:  # Open the safety data sheet page; returns True when cards are showing
+    page_urls_to_try = (
+        [SDS_PAGE_FILTERED_URL, SDS_PAGE_PLAIN_URL]
+        if TRY_FILTERED_SDS_URL_FIRST
+        else [SDS_PAGE_PLAIN_URL]
+    )  # The filtered address is tried first, the plain one is the fallback
+    for page_url in page_urls_to_try:  # Try the addresses in order
+        page_status = open_page_politely(
+            browser_page, page_url, run_statistics
+        )  # Open the page, backing off if blocked
+        if page_status != PAGE_STATUS_OPENED:  # The page did not open normally
+            download_logger.warning(
+                "[SDS page] could not open %s (status: %s)", page_url, page_status
+            )  # Record it
+            continue  # Try the next address
+        dismiss_cookie_banner(browser_page)  # Close the cookie popup if it is present
+        if wait_for_sds_cards_to_appear(browser_page, 25):  # Cards are showing
+            download_logger.info(
+                "[SDS page] opened with results: %s", page_url
+            )  # Record it
+            return True  # Done
+        download_logger.warning(
+            "[SDS page] no result cards showed up at %s", page_url
+        )  # The filtered address may not be understood by the site
+    return False  # Nothing worked
+
+
+def download_us_english_urls(
+    browser_session: "BrowserSession",
+    download_database: DownloadDatabase,
+    us_english_urls: set,
+    run_statistics: RunStatistics,
+) -> bool:  # Download every address that has no file yet; returns True when a request was made
+    pending_urls = sorted(
+        us_english_url
+        for us_english_url in us_english_urls
+        if not download_database.is_file_for_url_already_downloaded(us_english_url)
+    )  # The download folder is checked first, so existing files are never requested again
+    skipped_count = len(us_english_urls) - len(
+        pending_urls
+    )  # How many were already on disk
+    run_statistics.skipped_count += skipped_count  # Count them as skipped
+    if not pending_urls:  # Nothing to do
+        download_logger.info(
+            "[SDS page] nothing new to download (%d already saved)", skipped_count
+        )  # Record it
+        return False  # No request was made
+    download_database.save_newly_found_urls(
+        set(pending_urls)
+    )  # Store the addresses so a failed one can be retried later
+    browser_session.internet_monitor.raise_error_if_internet_is_down()  # Do not open a tab while the internet is down
+    with browser_session.temporary_download_tab() as download_page:  # Open the second tab and close it afterwards
+        for url_position, pending_url in enumerate(
+            pending_urls
+        ):  # Download one address at a time
+            browser_session.internet_monitor.raise_error_if_internet_is_down()  # Stop here and wait if the internet is down
+            if url_position > 0:  # Only pause between two real requests
+                browser_session.active_results_page.bring_to_front()  # Show the results tab, because a hidden tab would look odd to the website
+                pause_while_acting_like_a_human(
+                    browser_session.active_results_page,
+                    *PAUSE_SECONDS_RANGE_BETWEEN_DOWNLOADS,
+                    "between downloads",
+                )  # Move the mouse and scroll instead of sitting still
+            download_logger.info(
+                "  (%d/%d) US English: %s",
+                url_position + 1,
+                len(pending_urls),
+                pending_url,
+            )  # Record the progress
+            download_single_url(
+                download_page,
+                download_database,
+                pending_url,
+                run_statistics,
+                browser_session.internet_monitor,
+            )  # Download it
+    log_run_statistics(
+        run_statistics, "Totals so far"
+    )  # Show the totals after this page
+    return True  # Requests were made
+
+
+def download_all_us_english_sds(
+    browser_session: "BrowserSession",
+    download_database: DownloadDatabase,
+    run_statistics: RunStatistics,
+) -> None:  # Walk through every result page and download the "English - United States" documents
+    results_page = (
+        browser_session.active_results_page
+    )  # The tab used for browsing the results
+    browser_session.close_unneeded_tabs()  # Start with only the results tab open
+    browser_session.internet_monitor.raise_error_if_internet_is_down()  # Wait for the internet before opening the page
+    download_logger.info(
+        "Job 2: US English documents from %s", SDS_PAGE_PLAIN_URL
+    )  # Record what we are about to do
+    if not open_sds_search_page(
+        results_page, run_statistics
+    ):  # Open the page and wait for cards
+        if (
+            browser_session.internet_monitor.confirm_internet_is_down()
+        ):  # The internet is the reason
+            raise InternetOutageError(
+                "The internet went down while opening the SDS page"
+            )  # Wait for it, then retry
+        download_logger.error(
+            "[SDS page] could not open the page with results, giving up on job 2"
+        )  # Record it
+        return  # Nothing more to do
+    pause_while_acting_like_a_human(
+        results_page,
+        *ACTIVITY_SECONDS_RANGE_AFTER_OPENING_SEARCH_PAGE,
+        "after opening the SDS page",
+    )  # Move the mouse and scroll before reading the results
+
+    total_us_english_links_seen = 0  # Running count of US English links found
+    for page_number in range(
+        1, MAXIMUM_SDS_RESULT_PAGES + 1
+    ):  # Walk through the result pages
+        browser_session.close_unneeded_tabs()  # Close any tab other than the results and download tabs
+        browser_session.internet_monitor.raise_error_if_internet_is_down()  # Stop here and wait if the internet is down
+        results_page.bring_to_front()  # Keep the results tab in front
+
+        card_descriptions = read_sds_cards(results_page)  # Read every card on this page
+        all_links_on_page = tuple(
+            card_description["href"] for card_description in card_descriptions
+        )  # Every address on the page, used to notice when the page changes
+        us_english_urls = get_us_english_urls_from_cards(
+            card_descriptions
+        )  # Keep the US English ones
+        total_us_english_links_seen += len(us_english_urls)  # Add them to the total
+        download_logger.info(
+            "[SDS page] page %d (%s): %d card(s), %d US English, %d US English in total",
+            page_number,
+            read_sds_page_position(results_page),
+            len(card_descriptions),
+            len(us_english_urls),
+            total_us_english_links_seen,
+        )  # Show progress
+
+        if us_english_urls:  # Only download when this page has something
+            download_us_english_urls(
+                browser_session, download_database, us_english_urls, run_statistics
+            )  # Download the US English documents of this page
+
+        pause_while_acting_like_a_human(
+            results_page,
+            *PAUSE_SECONDS_RANGE_BETWEEN_RESULT_PAGES,
+            "before the next result page",
+        )  # Move the mouse and scroll instead of sitting still
+        results_page.bring_to_front()  # Return to the results tab before looking for the next page button
+        if not click_next_sds_page(results_page):  # Try to go to the next page
+            download_logger.info("[SDS page] there is no further page")  # Record it
+            break  # The last page was reached
+        if not wait_for_sds_cards_to_change(
+            results_page, all_links_on_page
+        ):  # Wait until the next page's cards are showing
+            download_logger.warning(
+                "[SDS page] the cards did not change after clicking next, stopping"
+            )  # Explain why we stop
+            break  # Stop, because paging does not work any more
+        if not is_results_page_usable(
+            results_page, run_statistics
+        ):  # Check for the error page or "Access Denied"
+            download_logger.warning(
+                "[SDS page] the next result page is not usable, stopping"
+            )  # Explain the stop
+            break  # Stop here
+
+    download_logger.info(
+        "[SDS page] finished; %d US English link(s) seen", total_us_english_links_seen
+    )  # Summarise the job
+    browser_session.close_unneeded_tabs()  # The job is done, so close anything that is not needed
 
 
 # ============================================================== INTERNET MONITOR
@@ -2651,6 +2989,7 @@ def run_sds_downloader() -> None:  # Run the whole job from start to finish
                 )  # Record the problem
             browser_session.close_unneeded_tabs()  # Leave only the results tab open after the warm-up
 
+            # ---------------- JOB 1: keyword search on the chemical standards pages
             still_failed_keywords: list = (
                 []
             )  # Keywords that could not be searched even after a second try
@@ -2674,7 +3013,7 @@ def run_sds_downloader() -> None:  # Run the whole job from start to finish
 
             download_logger.info(
                 "All keywords searched: downloading the best available version of every remaining document"
-            )  # Record the final step
+            )  # Record the final step of job 1
             run_step_and_restart_browser_if_needed(  # Download the remaining documents, restarting the browser if it closes
                 browser_session,  # The session that owns the browser
                 "the final download of the best remaining versions",  # Description used in log messages
@@ -2687,6 +3026,21 @@ def run_sds_downloader() -> None:  # Run the whole job from start to finish
                     run_statistics,
                 ),  # Re-reads the waiting documents on every attempt
             )  # End of the restart wrapper
+            log_run_statistics(
+                run_statistics, "JOB 1 FINISHED"
+            )  # Show the totals after job 1
+
+            # ---------------- JOB 2: every "English - United States" document on the SDS search page
+            run_step_and_restart_browser_if_needed(  # Walk the SDS result pages, restarting the browser if it closes
+                browser_session,  # The session that owns the browser
+                "the US English SDS pages",  # Description used in log messages
+                lambda: download_all_us_english_sds(
+                    browser_session, download_database, run_statistics
+                ),  # The work to do for job 2
+            )  # End of the restart wrapper
+            log_run_statistics(
+                run_statistics, "JOB 2 FINISHED"
+            )  # Show the totals after job 2
         finally:  # Always runs, even after an error
             internet_monitor.stop_monitoring()  # Stop the background internet check
             browser_session.close_all_tabs()  # The work is finished, so close every tab and window
